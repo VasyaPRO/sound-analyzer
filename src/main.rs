@@ -9,14 +9,14 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    prelude::{Constraint, Direction, Layout},
+    prelude::{Constraint, Direction, Layout, Backend, Rect},
     style::{Color, Style},
     symbols,
     widgets::{
         Axis, Bar, BarChart, BarGroup, Block, Chart, Dataset, GraphType,
         Paragraph,
     },
-    Terminal,
+    Terminal, Frame,
 };
 use rustfft::{
     num_complex::{Complex, ComplexFloat},
@@ -26,7 +26,7 @@ use std::{io, sync::atomic::AtomicUsize, time::Duration};
 
 use crate::{ascii_symbols::get_note_ascii, algo::{compute_cmndf, WINDOW_SIZE, apply_window}};
 
-use self::algo::{BLOCK_SIZE, FFT_SIZE, CMNDF_THRESHOLD};
+use self::algo::{BLOCK_SIZE, FFT_SIZE, CMNDF_THRESHOLD, compute_f0};
 
 
 enum Graph {
@@ -37,6 +37,7 @@ enum Graph {
 struct State {
     running: bool,
     cursor_pos: (u16, u16),
+    sample_rate: f32,
     apply_window: bool,
     target_frequency: Option<f32>,
     graph: Graph,
@@ -50,62 +51,89 @@ impl Default for State {
             target_frequency: None,
             graph: Graph::AmplitudeSpectrum,
             cursor_pos: (0, 0),
+            sample_rate: 0.0,
         }
     }
 }
 
-fn parabolic_interpolation(u: f32, v: f32, w: f32) -> f32 {
-    0.5 * (u - w) / (u - 2.0 * v + w)
-}
 
 mod ascii_symbols;
 
 mod algo {
     use rustfft::num_complex::Complex;
 
-pub const WINDOW_SIZE: usize = 1024;
-pub const BLOCK_SIZE: usize = WINDOW_SIZE * 2;
-pub const FFT_SIZE: usize = 8192;
-pub const CMNDF_THRESHOLD: f32 = 0.03;
+    pub const WINDOW_SIZE: usize = 1024;
+    pub const BLOCK_SIZE: usize = WINDOW_SIZE * 2;
+    pub const FFT_SIZE: usize = 8192;
+    pub const CMNDF_THRESHOLD: f32 = 0.03;
 
-// Cumulative mean normalized difference function
-pub fn compute_cmndf(x: &[f32]) -> Vec<f32> {
-    let samples_count = x.len() / 2;
-    let mut sum_difference_squared = vec![0.0; samples_count];
-    for lag in 0..samples_count {
-        let mut sum = 0.0;
-        for i in 0..samples_count {
-            let val = x[i] - x[i + lag];
-            sum += val * val;
+    // Cumulative mean normalized difference function
+    pub fn compute_cmndf(x: &[f32]) -> Vec<f32> {
+        let samples_count = x.len() / 2;
+        let mut sum_difference_squared = vec![0.0; samples_count];
+        for lag in 0..samples_count {
+            let mut sum = 0.0;
+            for i in 0..samples_count {
+                let val = x[i] - x[i + lag];
+                sum += val * val;
+            }
+            sum_difference_squared[lag] = sum;
         }
-        sum_difference_squared[lag] = sum;
+        let mut cmndf = vec![0.0; samples_count];
+        cmndf[0] = 1.0;
+        let mut prefix_sum = 0.0;
+        for lag in 1..samples_count {
+            prefix_sum += sum_difference_squared[lag];
+            let den = if prefix_sum == 0.0 {
+                1.0
+            } else {
+                prefix_sum / lag as f32
+            };
+            cmndf[lag] = sum_difference_squared[lag] / den;
+        }
+        cmndf
     }
-    let mut cmndf = vec![0.0; samples_count];
-    cmndf[0] = 1.0;
-    let mut prefix_sum = 0.0;
-    for lag in 1..samples_count {
-        prefix_sum += sum_difference_squared[lag];
-        let den = if prefix_sum == 0.0 {
-            1.0
-        } else {
-            prefix_sum / lag as f32
-        };
-        cmndf[lag] = sum_difference_squared[lag] / den;
-    }
-    cmndf
-}
 
 
-// Hann window
-pub fn apply_window(data: &mut [Complex<f32>]) {
-    let fft_size = data.len() as f32;
-    for (i, x) in data.iter_mut().enumerate() {
-        *x *= Complex {
-            re: 0.5 * (1.0 - f32::cos(2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1.0))),
-            im: 0.0,
-        };
+    // Hann window
+    pub fn apply_window(data: &mut [Complex<f32>]) {
+        let fft_size = data.len() as f32;
+        for (i, x) in data.iter_mut().enumerate() {
+            *x *= Complex {
+                re: 0.5 * (1.0 - f32::cos(2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1.0))),
+                im: 0.0,
+            };
+        }
     }
-}
+
+    fn parabolic_interpolation(u: f32, v: f32, w: f32) -> f32 {
+        0.5 * (u - w) / (u - 2.0 * v + w)
+    }
+
+    pub fn compute_f0(cmndf: &[f32], sample_rate: f32) -> f32 {
+        let mut min_pos = 20;
+        while cmndf[min_pos] > CMNDF_THRESHOLD && min_pos < WINDOW_SIZE - 1 {
+            min_pos += 1;
+        }
+
+        if min_pos == WINDOW_SIZE - 1 {
+            min_pos = cmndf[1..WINDOW_SIZE - 1]
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(index, _)| index)
+                .unwrap()
+                + 1;
+        }
+
+        sample_rate
+        / (min_pos as f32
+        + parabolic_interpolation(
+            cmndf[min_pos - 1],
+            cmndf[min_pos],
+            cmndf[min_pos + 1],
+        ))
+    }
 }
 
 
@@ -140,6 +168,116 @@ fn get_note(frequency: f32) -> (i32, f32) {
         // get_cents(frequency, exact_frequency),
         exact_frequency,
     )
+}
+
+fn draw_graph<B>(frame: &mut Frame<B>, area: Rect, state: &State, fft_buf: &[Complex<f32>], cmndf: &[f32], current_frequency: f32) 
+    where B: Backend
+{
+    let mut datasets = Vec::new();
+    let graph_data;
+    let x_bounds;
+    let y_bounds;
+    let cmndf_threshold;
+
+    match state.graph {
+        Graph::AmplitudeSpectrum => {
+            let bin_step = state.sample_rate / FFT_SIZE as f32;
+            graph_data = fft_buf[1..FFT_SIZE / 2 + 1]
+                .iter()
+                .enumerate()
+                .map(|p| {
+                    (
+                        f64::ln((bin_step * p.0 as f32).into()),
+                        20.0 * f64::log10(p.1.abs() as f64 / FFT_SIZE as f64),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            x_bounds = [
+                f64::ln(bin_step.into()),
+                f64::ln(state.sample_rate as f64 / 2.0),
+            ];
+
+            y_bounds = [-120.0, 0.0];
+        }
+        Graph::CMNDF => {
+            graph_data = cmndf[1..]
+                .iter()
+                .enumerate()
+                .map(|(index, &val)| {
+                    (
+                        f64::ln((state.sample_rate / (index + 1) as f32).into()),
+                        val as f64,
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            x_bounds = [
+                f64::ln(state.sample_rate as f64 / (cmndf.len() - 1) as f64),
+                f64::ln(state.sample_rate as f64 / 2.0),
+            ];
+
+            y_bounds = [0.0, 5.0];
+
+            cmndf_threshold = [(x_bounds[0], CMNDF_THRESHOLD as f64),
+                (x_bounds[1], CMNDF_THRESHOLD as f64)];
+
+            datasets.push(Dataset::default()
+                .name("CMNDF threshold")
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Yellow))
+                .data(&cmndf_threshold));
+        },
+    }
+
+    let target_freq;
+    if let Some(target_frequency) = state.target_frequency {
+        target_freq = Some([(f64::ln(target_frequency.into()), y_bounds[0]),
+            (f64::ln(target_frequency.into()), y_bounds[1])]);
+
+        datasets.push(Dataset::default()
+            .name("Target frequency")
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Gray))
+            .data(target_freq.as_ref().unwrap()));
+    }
+
+    let current_freq = [(f64::ln(current_frequency.into()), y_bounds[0]),
+        (f64::ln(current_frequency.into()), y_bounds[1])];
+
+    datasets.push(
+        Dataset::default()
+            .name("Current frequency")
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Red))
+            .data(&current_freq));
+
+    datasets.push(Dataset::default()
+        .name(match state.graph {
+            Graph::AmplitudeSpectrum => "Amplitude spectrum",
+            Graph::CMNDF => "Cumulative mean normalized difference function",
+        })
+        .marker(symbols::Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Magenta))
+        .data(&graph_data));
+
+    let graph_chart = Chart::new(datasets)
+        .x_axis(
+            Axis::default()
+                .style(Style::default().fg(Color::White))
+                .bounds(x_bounds),
+        )
+        .y_axis(
+            Axis::default()
+                .style(Style::default().fg(Color::White))
+                .bounds(y_bounds),
+        );
+
+    frame.render_widget(graph_chart, area);
 }
 
 
@@ -212,6 +350,7 @@ fn main() -> io::Result<()> {
     let mut frequencies = Vec::new();
 
     let mut state = State::default();
+    state.sample_rate = config.sample_rate.0 as f32;
     let mut avg_f0 = 0.0;
     let mut avg_db = 0.0;
 
@@ -244,30 +383,7 @@ fn main() -> io::Result<()> {
                     / BLOCK_SIZE as f32,
             );
 
-            let mut min_pos = 1;
-            while cmndf[min_pos] > CMNDF_THRESHOLD && min_pos < WINDOW_SIZE - 1 {
-                min_pos += 1;
-            }
-
-            if min_pos == WINDOW_SIZE - 1 {
-                min_pos = cmndf[1..WINDOW_SIZE - 1]
-                    .iter()
-                    .enumerate()
-                    .min_by(|(_, a), (_, b)| a.total_cmp(b))
-                    .map(|(index, _)| index)
-                    .unwrap()
-                    + 1;
-            }
-
-            // let sample_rate = 48000;
-            // let sr = config.sample_rate;
-            let f0: f32 = config.sample_rate.0 as f32
-                / (min_pos as f32
-                    + parabolic_interpolation(
-                        cmndf[min_pos - 1],
-                        cmndf[min_pos],
-                        cmndf[min_pos + 1],
-                    ));
+            let f0 = compute_f0(&cmndf, state.sample_rate);
             avg_f0 = avg_f0 + 0.1 * (f0 - avg_f0);
             // avg_f0 = f0;
             // println!("{}hz", f0);
@@ -391,112 +507,8 @@ fn main() -> io::Result<()> {
                 //     .bars(&[Bar::default().value(200), Bar::default().value(150)]);
                 f.render_widget(bar_chart, layout[1]);
 
-                let mut datasets = Vec::new();
-                let graph_data;
-                let x_bounds;
-                let y_bounds;
-                let cmndf_threshold;
 
-                match state.graph {
-                    Graph::AmplitudeSpectrum => {
-                        let bin_step = config.sample_rate.0 as f32 / FFT_SIZE as f32;
-                        graph_data = fft_buf[1..FFT_SIZE / 2 + 1]
-                            .iter()
-                            .enumerate()
-                            .map(|p| {
-                                (
-                                    f64::ln((bin_step * p.0 as f32).into()),
-                                    20.0 * f64::log10(p.1.abs() as f64 / FFT_SIZE as f64),
-                                )
-                            })
-                            .collect::<Vec<_>>();
-
-                        x_bounds = [
-                            f64::ln(bin_step.into()),
-                            f64::ln(config.sample_rate.0 as f64 / 2.0),
-                        ];
-
-                        y_bounds = [-120.0, 0.0];
-                    }
-                    Graph::CMNDF => {
-                        graph_data = cmndf[1..]
-                            .iter()
-                            .enumerate()
-                            .map(|(index, &val)| {
-                                (
-                                    f64::ln((config.sample_rate.0 as f32 / (index + 1) as f32).into()),
-                                    val as f64,
-                                )
-                            })
-                            .collect::<Vec<_>>();
-
-                        x_bounds = [
-                            f64::ln(config.sample_rate.0 as f64 / (cmndf.len() - 1) as f64),
-                            f64::ln(config.sample_rate.0 as f64 / 2.0),
-                        ];
-
-                        y_bounds = [0.0, 5.0];
-
-                        cmndf_threshold = [(x_bounds[0], CMNDF_THRESHOLD as f64),
-                            (x_bounds[1], CMNDF_THRESHOLD as f64)];
-
-                        datasets.push(Dataset::default()
-                            .name("CMNDF threshold")
-                            .marker(symbols::Marker::Braille)
-                            .graph_type(GraphType::Line)
-                            .style(Style::default().fg(Color::Yellow))
-                            .data(&cmndf_threshold));
-                    },
-                }
-
-                let target_freq;
-                if let Some(target_frequency) = state.target_frequency {
-                    target_freq = Some([(f64::ln(target_frequency.into()), y_bounds[0]),
-                        (f64::ln(target_frequency.into()), y_bounds[1])]);
-
-                    datasets.push(Dataset::default()
-                        .name("Target frequency")
-                        .marker(symbols::Marker::Braille)
-                        .graph_type(GraphType::Line)
-                        .style(Style::default().fg(Color::Gray))
-                        .data(target_freq.as_ref().unwrap()));
-                }
-
-                let current_freq = [(f64::ln(avg_f0.into()), y_bounds[0]),
-                    (f64::ln(avg_f0.into()), y_bounds[1])];
-
-                datasets.push(
-                    Dataset::default()
-                    .name("Current frequency")
-                    .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(Color::Red))
-                    .data(&current_freq));
-
-                datasets.push(Dataset::default()
-                    .name(match state.graph {
-                        Graph::AmplitudeSpectrum => "Amplitude spectrum",
-                        Graph::CMNDF => "Cumulative mean normalized difference function",
-                    })
-                    .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(Color::Magenta))
-                    .data(&graph_data));
-
-                let graph_chart = Chart::new(datasets)
-                    .x_axis(
-                        Axis::default()
-                            .style(Style::default().fg(Color::White))
-                            .bounds(x_bounds),
-                    )
-                    .y_axis(
-                        Axis::default()
-                            .style(Style::default().fg(Color::White))
-                            .bounds(y_bounds),
-                    );
-
-                f.render_widget(graph_chart, layout[2]);
-
+                draw_graph(f, layout[2], &state, &fft_buf, &cmndf, avg_f0);
                 // let mut mx: f64 = 0.0;
                 // for x in &spectrum_data {
                 //     mx = mx.max(x.1);
