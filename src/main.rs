@@ -9,11 +9,11 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    prelude::{Alignment, Constraint, Direction, Layout},
+    prelude::{Constraint, Direction, Layout},
     style::{Color, Style},
     symbols,
     widgets::{
-        Axis, Bar, BarChart, BarGroup, Block, BorderType, Borders, Chart, Dataset, GraphType,
+        Axis, Bar, BarChart, BarGroup, Block, Chart, Dataset, GraphType,
         Paragraph,
     },
     Terminal,
@@ -24,14 +24,22 @@ use rustfft::{
 };
 use std::{io, sync::atomic::AtomicUsize, time::Duration};
 
-use crate::ascii_symbols::get_note_ascii;
+use crate::{ascii_symbols::get_note_ascii, algo::{compute_cmndf, WINDOW_SIZE, apply_window}};
 
-const WINDOW_SIZE: usize = 1024;
+use self::algo::{BLOCK_SIZE, FFT_SIZE, CMNDF_THRESHOLD};
+
+
+enum Graph {
+    AmplitudeSpectrum,
+    CMNDF,
+}
 
 struct State {
     running: bool,
+    cursor_pos: (u16, u16),
     apply_window: bool,
     target_frequency: Option<f32>,
+    graph: Graph,
 }
 
 impl Default for State {
@@ -40,6 +48,8 @@ impl Default for State {
             running: true,
             apply_window: true,
             target_frequency: None,
+            graph: Graph::AmplitudeSpectrum,
+            cursor_pos: (0, 0),
         }
     }
 }
@@ -48,207 +58,18 @@ fn parabolic_interpolation(u: f32, v: f32, w: f32) -> f32 {
     0.5 * (u - w) / (u - 2.0 * v + w)
 }
 
-mod ascii_symbols {
+mod ascii_symbols;
 
-pub const ASCII_LETTERS: [[&str; 7]; 17] = [
-    [
-        "  ## ##   ",
-        "  ## ##   ",
-        "######### ",
-        " ## ##    ",
-        "######### ",
-        "  ## ##   ",
-        "  ## ##   ",
-    ],
-    [
-        "   ##   ",
-        " ####   ",
-        "   ##   ",
-        "   ##   ",
-        "   ##   ",
-        "   ##   ",
-        " ###### ",
-    ],
-    [
-        " #######  ",
-        "##     ## ",
-        "       ## ",
-        " #######  ",
-        "##        ",
-        "##        ",
-        "######### ",
-    ],
-    [
-        " #######  ",
-        "##     ## ",
-        "       ## ",
-        " #######  ",
-        "       ## ",
-        "##     ## ",
-        " #######  ",
-    ],
-    [
-        "##    ##  ",
-        "##    ##  ",
-        "##    ##  ",
-        "##    ##  ",
-        "######### ",
-        "      ##  ",
-        "      ##  ",
-    ],
-    [
-        "########  ",
-        "##        ",
-        "##        ",
-        "#######   ",
-        "      ##  ",
-        "##    ##  ",
-        " ######   ",
-    ],
-    [
-        " #######  ",
-        "##     ## ",
-        "##        ",
-        "########  ",
-        "##     ## ",
-        "##     ## ",
-        " #######  ",
-    ],
-    [
-        "########  ",
-        "##    ##  ",
-        "    ##    ",
-        "   ##     ",
-        "  ##      ",
-        "  ##      ",
-        "  ##      ",
-    ],
-    [
-        " #######  ",
-        "##     ## ",
-        "##     ## ",
-        " #######  ",
-        "##     ## ",
-        "##     ## ",
-        " #######  ",
-    ],
-    [
-        " #######  ",
-        "##     ## ",
-        "##     ## ",
-        " ######## ",
-        "       ## ",
-        "##     ## ",
-        " #######  ",
-    ],
-    [
-        "   ###    ",
-        "  ## ##   ",
-        " ##   ##  ",
-        "##     ## ",
-        "######### ",
-        "##     ## ",
-        "##     ## ",
-    ],
-    [
-        "########  ",
-        "##     ## ",
-        "##     ## ",
-        "########  ",
-        "##     ## ",
-        "##     ## ",
-        "########  ",
-    ],
-    [
-        " ######  ",
-        "##    ## ",
-        "##       ",
-        "##       ",
-        "##       ",
-        "##    ## ",
-        " ######  ",
-    ],
-    [
-        "########  ",
-        "##     ## ",
-        "##     ## ",
-        "##     ## ",
-        "##     ## ",
-        "##     ## ",
-        "########  ",
-    ],
-    [
-        "######## ",
-        "##       ",
-        "##       ",
-        "######   ",
-        "##       ",
-        "##       ",
-        "######## ",
-    ],
-    [
-        "######## ",
-        "##       ",
-        "##       ",
-        "######   ",
-        "##       ",
-        "##       ",
-        "##       ",
-    ],
-    [
-        " ######  ",
-        "##    ## ",
-        "##       ",
-        "##   ### ",
-        "##    ## ",
-        "##    ## ",
-        " ######  ",
-    ],
-];
+mod algo {
+    use rustfft::num_complex::Complex;
 
-
-pub fn get_note_ascii(note: i32) -> Vec<String> {
-    let octave = (note.div_euclid(12) + 4).clamp(1, 9) as usize;
-
-    fn combine_two(a: usize, b: usize) -> Vec<String> {
-        ASCII_LETTERS[a]
-            .iter()
-            .zip(ASCII_LETTERS[b])
-            .map(|(&s, t)| s.to_owned() + t)
-            .collect()
-    }
-
-    fn combine_three(a: usize, b: usize, c: usize) -> Vec<String> {
-        ASCII_LETTERS[a]
-            .iter()
-            .zip(ASCII_LETTERS[b])
-            .zip(ASCII_LETTERS[c])
-            .map(|((&s, t), u)| s.to_owned() + t + u)
-            .collect()
-    }
-
-    match note.rem_euclid(12) {
-        0 => combine_two(10, octave),
-        1 => combine_three(10, 0, octave),
-        2 => combine_two(11, octave),
-        3 => combine_two(12, octave),
-        4 => combine_three(12, 0, octave),
-        5 => combine_two(13, octave),
-        6 => combine_three(13, 0, octave),
-        7 => combine_two(14, octave),
-        8 => combine_two(15, octave),
-        9 => combine_three(15, 0, octave),
-        10 => combine_two(16, octave),
-        11 => combine_three(16, 0, octave),
-        _ => unreachable!()
-    }
-}
-
-}
-// use ascii_symbols::ASCII_LETTERS;
+pub const WINDOW_SIZE: usize = 1024;
+pub const BLOCK_SIZE: usize = WINDOW_SIZE * 2;
+pub const FFT_SIZE: usize = 8192;
+pub const CMNDF_THRESHOLD: f32 = 0.03;
 
 // Cumulative mean normalized difference function
-fn compute_cmndf(x: &[f32]) -> Vec<f32> {
+pub fn compute_cmndf(x: &[f32]) -> Vec<f32> {
     let samples_count = x.len() / 2;
     let mut sum_difference_squared = vec![0.0; samples_count];
     for lag in 0..samples_count {
@@ -273,6 +94,20 @@ fn compute_cmndf(x: &[f32]) -> Vec<f32> {
     }
     cmndf
 }
+
+
+// Hann window
+pub fn apply_window(data: &mut [Complex<f32>]) {
+    let fft_size = data.len() as f32;
+    for (i, x) in data.iter_mut().enumerate() {
+        *x *= Complex {
+            re: 0.5 * (1.0 - f32::cos(2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1.0))),
+            im: 0.0,
+        };
+    }
+}
+}
+
 
 fn get_cents(frequency: f32, target_frequency: f32) -> f32 {
     f32::log2(frequency / target_frequency) * 12.0 * 100.0
@@ -307,18 +142,6 @@ fn get_note(frequency: f32) -> (i32, f32) {
     )
 }
 
-// fn get_note_ascii(note: i32) -> Vec<String> {
-
-// Hann window
-fn apply_window(data: &mut [Complex<f32>]) {
-    let fft_size = data.len() as f32;
-    for (i, x) in data.iter_mut().enumerate() {
-        *x *= Complex {
-            re: 0.5 * (1.0 - f32::cos(2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1.0))),
-            im: 0.0,
-        };
-    }
-}
 
 fn main() -> io::Result<()> {
     // setup terminal
@@ -372,34 +195,28 @@ fn main() -> io::Result<()> {
                             / 24.0,
                     );
                     atomic_cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    sender.send(data[i]).unwrap();
-                    // sender.send(val).unwrap();
+                    // sender.send(data[i]).unwrap();
+                    sender.send(val).unwrap();
                 }
             },
-            move |_err| {
-                // dbg!(err);
-                // println!("err");
+            move |err| {
+                panic!("failed to get microphone input: {}", err)
             },
-            None, // None=blocking, Some(Duration)=timeout
+            None,
         )
         .unwrap();
     stream.play().unwrap();
-    // stream.
-    // std::thread::sleep(std::time::Duration::new(3, 0));
-    // drop(stream);
+
     let mut samples = Vec::new();
-    const BLOCK_SIZE: usize = WINDOW_SIZE * 2;
-    const FFT_SIZE: usize = 8192;
     let mut min_amount = BLOCK_SIZE.max(FFT_SIZE);
     let mut frequencies = Vec::new();
 
-    // let mut running = true;
     let mut state = State::default();
     let mut avg_f0 = 0.0;
     let mut avg_db = 0.0;
-    // let cursor_pos = backend.get_cursor()
 
-    let mut cursor_pos = (0, 0);
+    let fft = FftPlanner::<f32>::new().plan_fft_forward(FFT_SIZE);
+
     while state.running {
         while let Ok(sample) = reciever.try_recv() {
             assert!(f32::abs(sample) <= 1.0);
@@ -407,22 +224,17 @@ fn main() -> io::Result<()> {
         }
 
         if samples.len() >= min_amount {
-            let mut planner = FftPlanner::<f32>::new();
-            let fft = planner.plan_fft_forward(FFT_SIZE);
-
             let mut fft_buf = samples[min_amount - FFT_SIZE..min_amount]
                 .iter()
-                .map(|x| Complex { re: *x, im: 0.0 })
+                .map(|&x| Complex { re: x, im: 0.0 })
                 .collect::<Vec<_>>();
-            // let mut buffer = vec![Complex { re: 0.0, im: 0.0 }; BLOCK_SIZE];
 
             if state.apply_window {
                 apply_window(&mut fft_buf);
             }
+
             fft.process(&mut fft_buf);
 
-            // let freq: f32 = 0.0;
-            // dbg!(min_amount - BLOCK_SIZE, min_amount, samples.len());
             let cmndf = compute_cmndf(&samples[min_amount - BLOCK_SIZE..min_amount]);
             let rms = f32::sqrt(
                 samples[min_amount - BLOCK_SIZE..min_amount]
@@ -431,11 +243,12 @@ fn main() -> io::Result<()> {
                     .sum::<f32>()
                     / BLOCK_SIZE as f32,
             );
-            // frequencies.push(freq);
+
             let mut min_pos = 1;
-            while cmndf[min_pos] > 0.03 && min_pos < WINDOW_SIZE - 1 {
+            while cmndf[min_pos] > CMNDF_THRESHOLD && min_pos < WINDOW_SIZE - 1 {
                 min_pos += 1;
             }
+
             if min_pos == WINDOW_SIZE - 1 {
                 min_pos = cmndf[1..WINDOW_SIZE - 1]
                     .iter()
@@ -445,6 +258,7 @@ fn main() -> io::Result<()> {
                     .unwrap()
                     + 1;
             }
+
             // let sample_rate = 48000;
             // let sr = config.sample_rate;
             let f0: f32 = config.sample_rate.0 as f32
@@ -577,112 +391,157 @@ fn main() -> io::Result<()> {
                 //     .bars(&[Bar::default().value(200), Bar::default().value(150)]);
                 f.render_widget(bar_chart, layout[1]);
 
-                let bin_step = config.sample_rate.0 as f32 / FFT_SIZE as f32;
-                let spectrum_data = fft_buf[1..FFT_SIZE / 2 + 1]
-                    .iter()
-                    .enumerate()
-                    .map(|p| {
-                        (
-                            f64::ln((bin_step * p.0 as f32).into()),
-                            // p.1.abs() as f64 / FFT_SIZE as f64,
-                            20.0 * f64::log10(p.1.abs() as f64 / FFT_SIZE as f64),
-                            // let db = 20.0 * f32::log10(rms);
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                // .collect::<Vec<_>>();
-                let current_freq = [(f64::ln(state.target_frequency.unwrap_or(avg_f0).into()), -120.0),
-                    (f64::ln(state.target_frequency.unwrap_or(avg_f0).into()), 0.0)];
+                let mut datasets = Vec::new();
+                let graph_data;
+                let x_bounds;
+                let y_bounds;
+                let cmndf_threshold;
 
-                let ft_dataset = vec![Dataset::default()
-                    // .name("Fourier transform")
-                    //     .marker(symbols::Marker::Dot)
-                    //     .graph_type(GraphType::Scatter)
-                    //     .style(Style::default().fg(Color::Cyan))
-                    //     .data(&[(0.0, 5.0), (1.0, 6.0), (1.5, 6.434)]),
-                    // Dataset::default()
-                    // .name("data2")
-                    .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(Color::Magenta))
-                    // .data(&[(4.0, 5.0), (5.0, 8.0), (7.66, 13.5)]),
-                    .data(&spectrum_data),
+                match state.graph {
+                    Graph::AmplitudeSpectrum => {
+                        let bin_step = config.sample_rate.0 as f32 / FFT_SIZE as f32;
+                        graph_data = fft_buf[1..FFT_SIZE / 2 + 1]
+                            .iter()
+                            .enumerate()
+                            .map(|p| {
+                                (
+                                    f64::ln((bin_step * p.0 as f32).into()),
+                                    20.0 * f64::log10(p.1.abs() as f64 / FFT_SIZE as f64),
+                                )
+                            })
+                            .collect::<Vec<_>>();
 
+                        x_bounds = [
+                            f64::ln(bin_step.into()),
+                            f64::ln(config.sample_rate.0 as f64 / 2.0),
+                        ];
+
+                        y_bounds = [-120.0, 0.0];
+                    }
+                    Graph::CMNDF => {
+                        graph_data = cmndf[1..]
+                            .iter()
+                            .enumerate()
+                            .map(|(index, &val)| {
+                                (
+                                    f64::ln((config.sample_rate.0 as f32 / (index + 1) as f32).into()),
+                                    val as f64,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+
+                        x_bounds = [
+                            f64::ln(config.sample_rate.0 as f64 / (cmndf.len() - 1) as f64),
+                            f64::ln(config.sample_rate.0 as f64 / 2.0),
+                        ];
+
+                        y_bounds = [0.0, 5.0];
+
+                        cmndf_threshold = [(x_bounds[0], CMNDF_THRESHOLD as f64),
+                            (x_bounds[1], CMNDF_THRESHOLD as f64)];
+
+                        datasets.push(Dataset::default()
+                            .name("CMNDF threshold")
+                            .marker(symbols::Marker::Braille)
+                            .graph_type(GraphType::Line)
+                            .style(Style::default().fg(Color::Yellow))
+                            .data(&cmndf_threshold));
+                    },
+                }
+
+                let target_freq;
+                if let Some(target_frequency) = state.target_frequency {
+                    target_freq = Some([(f64::ln(target_frequency.into()), y_bounds[0]),
+                        (f64::ln(target_frequency.into()), y_bounds[1])]);
+
+                    datasets.push(Dataset::default()
+                        .name("Target frequency")
+                        .marker(symbols::Marker::Braille)
+                        .graph_type(GraphType::Line)
+                        .style(Style::default().fg(Color::Gray))
+                        .data(target_freq.as_ref().unwrap()));
+                }
+
+                let current_freq = [(f64::ln(avg_f0.into()), y_bounds[0]),
+                    (f64::ln(avg_f0.into()), y_bounds[1])];
+
+                datasets.push(
                     Dataset::default()
+                    .name("Current frequency")
                     .marker(symbols::Marker::Braille)
                     .graph_type(GraphType::Line)
                     .style(Style::default().fg(Color::Red))
-                    .data(&current_freq),
-                ];
+                    .data(&current_freq));
 
-                let ft_chart = Chart::new(ft_dataset)
-                    // .block(Block::default().title("Chart"))
+                datasets.push(Dataset::default()
+                    .name(match state.graph {
+                        Graph::AmplitudeSpectrum => "Amplitude spectrum",
+                        Graph::CMNDF => "Cumulative mean normalized difference function",
+                    })
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(Color::Magenta))
+                    .data(&graph_data));
+
+                let graph_chart = Chart::new(datasets)
                     .x_axis(
                         Axis::default()
-                            // .title(Span::styled("X Axis", Style::default().fg(Color::Red)))
                             .style(Style::default().fg(Color::White))
-                            // .bounds([0.0, BLOCK_SIZE as f64 / 2.0])
-                            .bounds([
-                                f64::ln(bin_step.into()),
-                                f64::ln(config.sample_rate.0 as f64 / 2.0),
-                            ]),
+                            .bounds(x_bounds),
                     )
                     .y_axis(
                         Axis::default()
-                            // .title(Span::styled("Y Axis", Style::default().fg(Color::Red)))
                             .style(Style::default().fg(Color::White))
-                            // .bounds([0.0, 0.5])
-                            .bounds([-120.0, 0.0]),
+                            .bounds(y_bounds),
                     );
-                // ft_chart.layout();
 
-                f.render_widget(ft_chart, layout[2]);
+                f.render_widget(graph_chart, layout[2]);
 
-                let mut mx: f64 = 0.0;
-                for x in &spectrum_data {
-                    mx = mx.max(x.1);
-                }
+                // let mut mx: f64 = 0.0;
+                // for x in &spectrum_data {
+                //     mx = mx.max(x.1);
+                // }
 
-                let inside = cursor_pos.0 >= layout[2].top()
-                    && cursor_pos.0 < layout[2].bottom()
-                    && cursor_pos.1 > 0
-                    && cursor_pos.1 < terminal_width - 1;
-                let mut cursor_freq = 0.0;
-                if inside {
-                    // frequency = cursor_pos
-                    // 1 -> log(bin)
-                    // terminal_width - 1 -> log(sample_rate)
-                    // terminal_width - 2
-
-                    let log_x = f32::ln(bin_step)
-                        + (cursor_pos.1 - 1) as f32
-                            * f32::ln(config.sample_rate.0 as f32 / 2.0 / bin_step)
-                            / (terminal_width - 3) as f32;
-                    cursor_freq = f32::exp(log_x);
-                    // cursor_pos.1 - 1
-                    //01234
-                    // ln(bin_step * p.0 as f64)
-                    // ln
-                }
-
-                f.render_widget(
-                    Paragraph::new(format!(
-                        "sec: {:9.3}\n\
-                        {}, {}, {bin_step} {inside}, {}
-                    ",
-                        mx, cursor_pos.0, cursor_pos.1, cursor_freq
-                    ))
-                    .block(
-                        Block::default()
-                            .title("Template")
-                            .title_alignment(Alignment::Center)
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded),
-                    )
-                    .style(Style::default().fg(Color::Cyan).bg(Color::Black))
-                    .alignment(Alignment::Center),
-                    layout[3],
-                );
+                // let inside = cursor_pos.0 >= layout[2].top()
+                //     && cursor_pos.0 < layout[2].bottom()
+                //     && cursor_pos.1 > 0
+                //     && cursor_pos.1 < terminal_width - 1;
+                // let mut cursor_freq = 0.0;
+                // if inside {
+                //     // frequency = cursor_pos
+                //     // 1 -> log(bin)
+                //     // terminal_width - 1 -> log(sample_rate)
+                //     // terminal_width - 2
+                //
+                //     let log_x = f32::ln(bin_step)
+                //         + (cursor_pos.1 - 1) as f32
+                //             * f32::ln(config.sample_rate.0 as f32 / 2.0 / bin_step)
+                //             / (terminal_width - 3) as f32;
+                //     cursor_freq = f32::exp(log_x);
+                //     // cursor_pos.1 - 1
+                //     //01234
+                //     // ln(bin_step * p.0 as f64)
+                //     // ln
+                // }
+                //
+                // f.render_widget(
+                //     Paragraph::new(format!(
+                //         "sec: {:9.3}\n\
+                //         {}, {}, {bin_step} {inside}, {}
+                //     ",
+                //         mx, cursor_pos.0, cursor_pos.1, cursor_freq
+                //     ))
+                //     .block(
+                //         Block::default()
+                //             .title("Template")
+                //             .title_alignment(Alignment::Center)
+                //             .borders(Borders::ALL)
+                //             .border_type(BorderType::Rounded),
+                //     )
+                //     .style(Style::default().fg(Color::Cyan).bg(Color::Black))
+                //     .alignment(Alignment::Center),
+                //     layout[3],
+                // );
             })?;
 
             loop {
@@ -733,10 +592,16 @@ fn main() -> io::Result<()> {
                                 event::KeyCode::Esc if key.kind == KeyEventKind::Press => {
                                     state.target_frequency = None;
                                 }
+                                event::KeyCode::Tab if key.kind == KeyEventKind::Press => {
+                                    state.graph = match state.graph {
+                                        Graph::AmplitudeSpectrum => Graph::CMNDF,
+                                        Graph::CMNDF => Graph::AmplitudeSpectrum,
+                                    }
+                                }
                                 _ => {}
                             },
                             Event::Mouse(e) if e.kind == MouseEventKind::Moved => {
-                                cursor_pos = (e.row, e.column)
+                                state.cursor_pos = (e.row, e.column)
                             }
                             _ => {}
                         }
