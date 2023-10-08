@@ -1,5 +1,5 @@
 [package]
-name = "sound-gui"
+name = "sound-analyzer"
 version = "0.1.0"
 edition = "2021"
 
