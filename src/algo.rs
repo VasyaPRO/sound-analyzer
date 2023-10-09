@@ -4,6 +4,7 @@ pub const WINDOW_SIZE: usize = 1024;
 pub const BLOCK_SIZE: usize = WINDOW_SIZE * 2;
 pub const FFT_SIZE: usize = 8192;
 pub const CMNDF_THRESHOLD: f32 = 0.03;
+pub const A4_FREQUENCY: f32 = 440.0;
 
 // Cumulative mean normalized difference function
 pub fn compute_cmndf(x: &[f32]) -> Vec<f32> {
@@ -22,12 +23,10 @@ pub fn compute_cmndf(x: &[f32]) -> Vec<f32> {
     let mut prefix_sum = 0.0;
     for lag in 1..samples_count {
         prefix_sum += sum_difference_squared[lag];
-        let den = if prefix_sum == 0.0 {
-            1.0
-        } else {
-            prefix_sum / lag as f32
-        };
-        cmndf[lag] = sum_difference_squared[lag] / den;
+        cmndf[lag] = sum_difference_squared[lag];
+        if prefix_sum != 0.0 {
+            cmndf[lag] /= prefix_sum / lag as f32;
+        }
     }
     cmndf
 }
@@ -76,15 +75,18 @@ pub fn get_cents(frequency: f32, target_frequency: f32) -> f32 {
     f32::log2(frequency / target_frequency) * 12.0 * 100.0
 }
 
-const A4_FREQUENCY: f32 = 440.0;
-
-fn get_note_index(frequency: f32) -> i32 {
+// note index is the number of semitones between A4 and the note
+fn get_note_index(frequency: f32) -> isize {
     let semitones = f32::log2(frequency / A4_FREQUENCY) * 12.0;
-    semitones.round() as i32
+    semitones.round() as isize
 }
 
-pub fn get_note(frequency: f32) -> (i32, f32) {
+pub fn get_note(frequency: f32) -> (isize, f32) {
     let note = get_note_index(frequency);
-    let exact_frequency = A4_FREQUENCY * 2.0_f32.powf(note as f32 / 12.0);
+    let exact_frequency = A4_FREQUENCY * compute_interval_ratio(note);
     (note, exact_frequency)
+}
+
+pub fn compute_interval_ratio(semitones: isize) -> f32 {
+    2.0_f32.powf(semitones as f32 / 12.0)
 }

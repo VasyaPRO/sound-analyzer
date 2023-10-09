@@ -26,7 +26,10 @@ use crate::{
     ascii_symbols::get_note_ascii,
 };
 
-use self::algo::{compute_f0, get_cents, get_note, lerp, BLOCK_SIZE, CMNDF_THRESHOLD, FFT_SIZE};
+use self::algo::{
+    compute_f0, compute_interval_ratio, get_cents, get_note, lerp, A4_FREQUENCY, BLOCK_SIZE,
+    CMNDF_THRESHOLD, FFT_SIZE,
+};
 
 enum Graph {
     AmplitudeSpectrum,
@@ -43,15 +46,15 @@ struct State {
     graph: Graph,
 }
 
-impl Default for State {
-    fn default() -> Self {
+impl State {
+    fn with_sample_rate(sample_rate: f32) -> Self {
         State {
             running: true,
             apply_window: true,
             target_frequency: None,
             graph: Graph::AmplitudeSpectrum,
             cursor_pos: (0, 0),
-            sample_rate: 0.0,
+            sample_rate,
             mouse_pressed: false,
         }
     }
@@ -85,7 +88,7 @@ fn draw_graph<B>(
                 .map(|(index, &val)| {
                     (
                         f64::ln(((state.sample_rate / FFT_SIZE as f32) * index as f32).into()),
-                        20.0 * f64::log10(val.abs() as f64 / FFT_SIZE as f64),
+                        20.0 * f64::log10(f64::from(val.abs()) / FFT_SIZE as f64),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -104,7 +107,7 @@ fn draw_graph<B>(
                 .map(|(index, &val)| {
                     (
                         f64::ln((state.sample_rate / (index + 1) as f32).into()),
-                        val as f64,
+                        f64::from(val),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -134,10 +137,10 @@ fn draw_graph<B>(
 
     let target_freq;
     if let Some(target_frequency) = state.target_frequency {
-        target_freq = Some([
+        target_freq = [
             (f64::ln(target_frequency.into()), y_bounds[0]),
             (f64::ln(target_frequency.into()), y_bounds[1]),
-        ]);
+        ];
 
         datasets.push(
             Dataset::default()
@@ -145,7 +148,7 @@ fn draw_graph<B>(
                 .marker(symbols::Marker::Braille)
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(Color::Gray))
-                .data(target_freq.as_ref().unwrap()),
+                .data(&target_freq),
         );
     }
 
@@ -186,6 +189,7 @@ fn draw_graph<B>(
                 .style(Style::default().fg(Color::White))
                 .bounds(y_bounds),
         )
+        .hidden_legend_constraints((Constraint::Ratio(3, 5), Constraint::Ratio(1, 2)))
         .bg(Color::Black);
 
     frame.render_widget(graph_chart, area);
@@ -210,6 +214,79 @@ where
         .max(100);
 
     frame.render_widget(bar_chart, area);
+}
+
+fn handle_events(state: &mut State) {
+    loop {
+        match event::poll(Duration::from_millis(0)) {
+            Ok(ready) if ready => {
+                let ev = event::read().unwrap();
+                match ev {
+                    Event::Key(key) => match key.code {
+                        event::KeyCode::Char('c' | 'C')
+                            if key.modifiers == KeyModifiers::CONTROL =>
+                        {
+                            state.running = false;
+                        }
+                        event::KeyCode::Char('w') if key.kind == KeyEventKind::Press => {
+                            state.apply_window = !state.apply_window;
+                        }
+                        event::KeyCode::Char(note_char)
+                            if ('a'..='g').contains(&note_char)
+                                && key.kind == KeyEventKind::Press =>
+                        {
+                            let semitones =
+                                [0, 2, -9, -7, -5, -4, -2][note_char as usize - 'a' as usize];
+                            state.target_frequency =
+                                Some(A4_FREQUENCY * compute_interval_ratio(semitones));
+                        }
+                        event::KeyCode::Up if key.kind == KeyEventKind::Press => {
+                            if let Some(freq) = state.target_frequency {
+                                state.target_frequency = Some(freq * 2.0);
+                            }
+                        }
+                        event::KeyCode::Down if key.kind == KeyEventKind::Press => {
+                            if let Some(freq) = state.target_frequency {
+                                state.target_frequency = Some(freq * 0.5);
+                            }
+                        }
+                        event::KeyCode::Right if key.kind == KeyEventKind::Press => {
+                            if let Some(freq) = state.target_frequency {
+                                state.target_frequency = Some(freq * compute_interval_ratio(1));
+                            }
+                        }
+                        event::KeyCode::Left if key.kind == KeyEventKind::Press => {
+                            if let Some(freq) = state.target_frequency {
+                                state.target_frequency = Some(freq * compute_interval_ratio(-1));
+                            }
+                        }
+                        event::KeyCode::Esc if key.kind == KeyEventKind::Press => {
+                            state.target_frequency = None;
+                        }
+                        event::KeyCode::Tab if key.kind == KeyEventKind::Press => {
+                            state.graph = match state.graph {
+                                Graph::AmplitudeSpectrum => Graph::CMNDF,
+                                Graph::CMNDF => Graph::AmplitudeSpectrum,
+                            }
+                        }
+                        _ => {}
+                    },
+                    Event::Mouse(e) if e.kind == MouseEventKind::Moved => {
+                        state.cursor_pos = (e.row, e.column);
+                    }
+                    Event::Mouse(e) if e.kind == MouseEventKind::Drag(event::MouseButton::Left) => {
+                        state.mouse_pressed = true;
+                        state.cursor_pos = (e.row, e.column);
+                    }
+                    Event::Mouse(e) if e.kind == MouseEventKind::Up(event::MouseButton::Left) => {
+                        state.mouse_pressed = false;
+                    }
+                    _ => {}
+                }
+            }
+            _ => break,
+        }
+    }
 }
 
 fn initialize_panic_handler() {
@@ -249,7 +326,7 @@ fn main() -> io::Result<()> {
                 // samples from different channels are received interleaved
                 // mix all the channels into single one by averaging
                 for b in data.chunks_exact(config.channels as usize) {
-                    let val = b.iter().sum::<f32>() / config.channels as f32;
+                    let val = b.iter().sum::<f32>() / f32::from(config.channels);
                     sender.send(val).unwrap();
                 }
             },
@@ -262,8 +339,7 @@ fn main() -> io::Result<()> {
     let mut samples = Vec::new();
     let mut min_amount = BLOCK_SIZE.max(FFT_SIZE);
 
-    let mut state = State::default();
-    state.sample_rate = config.sample_rate.0 as f32;
+    let mut state = State::with_sample_rate(config.sample_rate.0 as f32);
     let mut avg_f0 = 0.0;
     let mut avg_db = 0.0;
 
@@ -271,7 +347,6 @@ fn main() -> io::Result<()> {
 
     while state.running {
         while let Ok(sample) = reciever.try_recv() {
-            assert!(f32::abs(sample) <= 1.0);
             samples.push(sample);
         }
 
@@ -309,20 +384,15 @@ fn main() -> io::Result<()> {
                 avg_db = db;
             }
 
-            let (note_index, cents) = match state.target_frequency {
-                Some(target_frequency) => {
-                    let cents = get_cents(avg_f0, target_frequency);
-                    let (target_note, _) = get_note(target_frequency);
-                    (target_note, cents)
-                }
-                None => {
-                    let (note, exact_frequency) = get_note(avg_f0);
-                    let cents = get_cents(avg_f0, exact_frequency);
-                    (note, cents)
-                }
+            let (note_index, cents) = if let Some(target_frequency) = state.target_frequency {
+                let (target_note, _) = get_note(target_frequency);
+                let cents = get_cents(avg_f0, target_frequency);
+                (target_note, cents)
+            } else {
+                let (note, exact_frequency) = get_note(avg_f0);
+                let cents = get_cents(avg_f0, exact_frequency);
+                (note, cents)
             };
-
-            min_amount += BLOCK_SIZE / 2;
 
             terminal.draw(|f| {
                 let main_layout = Layout::default()
@@ -376,97 +446,20 @@ fn main() -> io::Result<()> {
                     && state.cursor_pos.1 < main_layout[2].right();
 
                 if is_inside && state.mouse_pressed {
-                    let alpha = (state.cursor_pos.1 - main_layout[2].left()) as f32
-                        / (main_layout[2].width - 1) as f32;
-                    let (low, high) = match state.graph {
-                        Graph::AmplitudeSpectrum => (
-                            f32::ln(state.sample_rate / FFT_SIZE as f32),
-                            f32::ln(state.sample_rate / 2.0),
-                        ),
-                        Graph::CMNDF => (
-                            f32::ln(state.sample_rate / (cmndf.len() - 1) as f32),
-                            f32::ln(state.sample_rate / 2.0),
-                        ),
+                    let low = match state.graph {
+                        Graph::AmplitudeSpectrum => f32::ln(state.sample_rate / FFT_SIZE as f32),
+                        Graph::CMNDF => f32::ln(state.sample_rate / (cmndf.len() - 1) as f32),
                     };
-                    let log_x = lerp(low, high, alpha);
-                    state.target_frequency = Some(f32::exp(log_x));
+                    let high = f32::ln(state.sample_rate / 2.0);
+                    let alpha = f32::from(state.cursor_pos.1 - main_layout[2].left())
+                        / f32::from(main_layout[2].width - 1);
+                    state.target_frequency = Some(f32::exp(lerp(low, high, alpha)));
                 }
             })?;
 
-            loop {
-                match event::poll(Duration::from_millis(0)) {
-                    Ok(ready) if ready => {
-                        let ev = event::read().unwrap();
-                        match ev {
-                            Event::Key(key) => match key.code {
-                                event::KeyCode::Char('c' | 'C')
-                                    if key.modifiers == KeyModifiers::CONTROL =>
-                                {
-                                    state.running = false;
-                                }
-                                event::KeyCode::Char('w') if key.kind == KeyEventKind::Press => {
-                                    state.apply_window = !state.apply_window;
-                                }
-                                event::KeyCode::Char(note_char)
-                                    if ('a'..='g').contains(&note_char)
-                                        && key.kind == KeyEventKind::Press =>
-                                {
-                                    let semitones = [0, 2, -9, -7, -5, -4, -2]
-                                        [note_char as usize - 'a' as usize];
-                                    state.target_frequency =
-                                        Some(440.0 * 2.0.powf(semitones as f32 / 12.0));
-                                }
-                                event::KeyCode::Up if key.kind == KeyEventKind::Press => {
-                                    if let Some(freq) = state.target_frequency {
-                                        state.target_frequency = Some(freq * 2.0);
-                                    }
-                                }
-                                event::KeyCode::Down if key.kind == KeyEventKind::Press => {
-                                    if let Some(freq) = state.target_frequency {
-                                        state.target_frequency = Some(freq * 0.5);
-                                    }
-                                }
-                                event::KeyCode::Right if key.kind == KeyEventKind::Press => {
-                                    if let Some(freq) = state.target_frequency {
-                                        state.target_frequency = Some(freq * 2.0.powf(1.0 / 12.0));
-                                    }
-                                }
-                                event::KeyCode::Left if key.kind == KeyEventKind::Press => {
-                                    if let Some(freq) = state.target_frequency {
-                                        state.target_frequency = Some(freq * 2.0.powf(-1.0 / 12.0));
-                                    }
-                                }
-                                event::KeyCode::Esc if key.kind == KeyEventKind::Press => {
-                                    state.target_frequency = None;
-                                }
-                                event::KeyCode::Tab if key.kind == KeyEventKind::Press => {
-                                    state.graph = match state.graph {
-                                        Graph::AmplitudeSpectrum => Graph::CMNDF,
-                                        Graph::CMNDF => Graph::AmplitudeSpectrum,
-                                    }
-                                }
-                                _ => {}
-                            },
-                            Event::Mouse(e) if e.kind == MouseEventKind::Moved => {
-                                state.cursor_pos = (e.row, e.column)
-                            }
-                            Event::Mouse(e)
-                                if e.kind == MouseEventKind::Drag(event::MouseButton::Left) =>
-                            {
-                                state.mouse_pressed = true;
-                                state.cursor_pos = (e.row, e.column)
-                            }
-                            Event::Mouse(e)
-                                if e.kind == MouseEventKind::Up(event::MouseButton::Left) =>
-                            {
-                                state.mouse_pressed = false;
-                            }
-                            _ => {}
-                        }
-                    }
-                    _ => break,
-                }
-            }
+            handle_events(&mut state);
+
+            min_amount += BLOCK_SIZE / 2;
         }
     }
 

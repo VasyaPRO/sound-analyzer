@@ -155,8 +155,16 @@ const ASCII_LETTERS: [[&str; 7]; 17] = [
 ];
 
 
-pub fn get_note_ascii(note: i32) -> Vec<String> {
-    let octave = (note.div_euclid(12) + 4 + if note.rem_euclid(12) > 2 { 1 } else { 0 }).clamp(1, 9) as usize;
+pub fn get_note_ascii(note: isize) -> Vec<String> {
+    let octave = note.div_euclid(12) +
+        if note.rem_euclid(12) <= 2 {
+            // A to B
+            4
+        } else {
+            // C to G#
+            5
+        };
+    let octave = octave.clamp(1, 9) as usize;
 
     fn combine_two(a: usize, b: usize) -> Vec<String> {
         ASCII_LETTERS[a]
