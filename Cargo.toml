@@ -1,0 +1,12 @@
+[package]
+name = "sound-analyzer"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+cpal = "0.15.2"
+crossterm = "0.27.0"
+ratatui = { version = "0.23.0", features = ["all-widgets", "macros"] }
+rustfft = "6.1.0"
